@@ -105,6 +105,12 @@ if libmodplug_dep.found()
   decoder_plugins_sources += 'ModplugDecoderPlugin.cxx'
 endif
 
+libopenmpt_dep = dependency('libopenmpt', required: get_option('openmpt'))
+decoder_features.set('ENABLE_OPENMPT', libopenmpt_dep.found())
+if libopenmpt_dep.found()
+  decoder_plugins_sources += 'OpenmptDecoderPlugin.cxx'
+endif
+
 libmpcdec_dep = c_compiler.find_library('mpcdec', required: get_option('mpcdec'))
 decoder_features.set('ENABLE_MPCDEC', libmpcdec_dep.found())
 if libmpcdec_dep.found()
@@ -185,6 +191,7 @@ decoder_plugins = static_library(
     libmad_dep,
     libmikmod_dep,
     libmodplug_dep,
+    libopenmpt_dep,
     libmpcdec_dep,
     libmpg123_dep,
     libopus_dep,
