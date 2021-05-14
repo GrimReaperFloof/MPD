@@ -18,24 +18,38 @@
  */
 
 #include "OpenmptDecoderPlugin.hxx"
-#include "ModCommon.hxx"
 #include "../DecoderAPI.hxx"
+#include "fs/NarrowPath.hxx"
 #include "input/InputStream.hxx"
 #include "tag/Handler.hxx"
+#include "tag/Builder.hxx"
 #include "tag/Type.h"
+#include "song/DetachedSong.hxx"
 #include "util/Domain.hxx"
 #include "util/RuntimeError.hxx"
+#include "util/StringCompare.hxx"
+#include "util/StringFormat.hxx"
 #include "util/StringView.hxx"
 #include "Log.hxx"
+#include "fs/Path.hxx"
+#include "fs/AllocatedPath.hxx"
 
+#include <fstream>
 #include <libopenmpt/libopenmpt.hpp>
 
 #include <cassert>
+
+#define SUBTUNE_PREFIX "tune_"
 
 static constexpr Domain openmpt_domain("openmpt");
 
 static constexpr size_t OPENMPT_FRAME_SIZE = 4096;
 static constexpr int32_t OPENMPT_SAMPLE_RATE = 48000;
+
+struct OpenmptContainerPath {
+	AllocatedPath path;
+	unsigned track;
+};
 
 static int openmpt_stereo_separation;
 static int openmpt_interpolation_filter;
@@ -59,19 +73,52 @@ openmpt_decoder_init(const ConfigBlock &block)
 	return true;
 }
 
+gcc_pure
+static unsigned
+ParseSubtuneName(const char *base) noexcept
+{
+	base = StringAfterPrefix(base, SUBTUNE_PREFIX);
+	if (base == nullptr)
+		return 0;
+
+	char *endptr;
+	auto track = strtoul(base, &endptr, 10);
+	if (endptr == base || *endptr != '.')
+		return 0;
+
+	return track;
+}
+
+
+/**
+ * returns the file path stripped of any /tune_xxx.* subtune suffix
+ * and the track number (or 0 if no "tune_xxx" suffix is present).
+ */
+static OpenmptContainerPath
+ParseContainerPath(Path path_fs)
+{
+	const Path base = path_fs.GetBase();
+	unsigned track;
+	if (base.IsNull() ||
+	    (track = ParseSubtuneName(NarrowPath(base))) < 1)
+		return { AllocatedPath(path_fs), 0 };
+
+	return { path_fs.GetDirectoryName(), track - 1 };
+}
+
 static void
-mod_decode(DecoderClient &client, InputStream &is)
+mod_decode(DecoderClient &client, Path path_fs)
 {
 	int ret;
 	char audio_buffer[OPENMPT_FRAME_SIZE];
 
-	const auto buffer = mod_loadfile(&openmpt_domain, &client, is);
-	if (buffer.IsNull()) {
-		LogWarning(openmpt_domain, "could not load stream");
-		return;
-	}
+	const auto container = ParseContainerPath(path_fs);
 
-	openmpt::module mod(buffer.data(), buffer.size());
+	std::ifstream file(container.path.c_str());
+	openmpt::module mod(file);
+	
+	const int song_num = container.track;
+	mod.select_subsong(song_num);
 
 	/* alter settings */
 	mod.set_render_param(mod.RENDER_STEREOSEPARATION_PERCENT, openmpt_stereo_separation);
@@ -90,7 +137,7 @@ mod_decode(DecoderClient &client, InputStream &is)
 	static constexpr AudioFormat audio_format(OPENMPT_SAMPLE_RATE, SampleFormat::FLOAT, 2);
 	assert(audio_format.IsValid());
 
-	client.Ready(audio_format, is.IsSeekable(),
+	client.Ready(audio_format, true,
 		     SongTime::FromS(mod.get_duration_seconds()));
 
 	DecoderCommand cmd;
@@ -111,27 +158,89 @@ mod_decode(DecoderClient &client, InputStream &is)
 	} while (cmd != DecoderCommand::STOP);
 }
 
-static bool
-openmpt_scan_stream(InputStream &is, TagHandler &handler) noexcept
+static void ScanModInfo(openmpt::module &mod, Path path_fs, unsigned subsong, TagHandler &handler) noexcept
 {
-	const auto buffer = mod_loadfile(&openmpt_domain, nullptr, is);
-	if (buffer.IsNull()) {
-		LogWarning(openmpt_domain, "could not load stream");
-		return false;
+	int subsongs = mod.get_num_subsongs();
+	std::string title = mod.get_metadata("title");
+
+	if (subsongs > 1) {
+		handler.OnTag(TAG_TRACK, (StringView)std::to_string(subsong + 1));
+		handler.OnTag(TAG_ALBUM, title.c_str());
+
+		std::string subsong_name = mod.get_subsong_names()[subsong];
+		if (!subsong_name.empty()) {
+			handler.OnTag(TAG_TITLE, subsong_name.c_str());
+		} else {
+			if (title.empty()) {
+				const auto container = ParseContainerPath(path_fs);
+				Path path = container.path;
+				title = path.GetBase().ToUTF8();
+			}
+
+			const auto tag_title =
+				StringFormat<1024>("%s (%u/%u)", title.c_str(), subsong + 1, subsongs);
+			handler.OnTag(TAG_TITLE, tag_title.c_str());
+		}
+	} else {
+		handler.OnTag(TAG_TITLE, title.c_str());
 	}
 
-	openmpt::module mod(buffer.data(), buffer.size());
-
-	handler.OnDuration(SongTime::FromS(mod.get_duration_seconds()));
-
-	/* Tagging */
-	handler.OnTag(TAG_TITLE, mod.get_metadata("title").c_str());
 	handler.OnTag(TAG_ARTIST, mod.get_metadata("artist").c_str());
 	handler.OnTag(TAG_COMMENT, mod.get_metadata("message").c_str());
 	handler.OnTag(TAG_DATE, mod.get_metadata("date").c_str());
 	handler.OnTag(TAG_PERFORMER, mod.get_metadata("tracker").c_str());
+}
 
+static bool
+openmpt_scan_file(Path path_fs, TagHandler &handler) noexcept
+{
+	const auto container = ParseContainerPath(path_fs);
+	const unsigned song_num = container.track;
+
+	std::ifstream file(container.path.c_str(), std::ios::binary);
+	openmpt::module mod(file);
+
+	mod.select_subsong(song_num);
+	
+	handler.OnDuration(SongTime::FromS(mod.get_duration_seconds()));
+	
+	ScanModInfo(mod, path_fs, song_num, handler);
 	return true;
+}
+
+static std::forward_list<DetachedSong>
+openmpt_container_scan(Path path_fs)
+{
+	std::forward_list<DetachedSong> list;
+
+	std::ifstream file(path_fs.c_str(), std::ios::binary);
+	openmpt::module mod(file);
+	
+	int32_t subsongs = mod.get_num_subsongs();
+
+	if (subsongs <= 1)
+		return list;
+	
+	TagBuilder tag_builder;
+
+	std::vector<std::string> subsong_names = mod.get_subsong_names();
+	
+	auto tail = list.before_begin();
+	for (int32_t i = 0; i <= subsongs - 1; ++i) {
+		mod.select_subsong(i);
+		
+		AddTagHandler h(tag_builder);
+		ScanModInfo(mod, path_fs, i, h);
+		h.OnDuration(SongTime::FromS(mod.get_duration_seconds()));
+		
+		std::string ext = mod.get_metadata("type");
+		tail = list.emplace_after(
+				tail,
+				StringFormat<32>(SUBTUNE_PREFIX "%03u.%s", i+1, ext.c_str()),
+				tag_builder.Commit());
+	}
+
+	return list;
 }
 
 static const char *const mod_suffixes[] = {
@@ -145,6 +254,7 @@ static const char *const mod_suffixes[] = {
 };
 
 constexpr DecoderPlugin openmpt_decoder_plugin =
-	DecoderPlugin("openmpt", mod_decode, openmpt_scan_stream)
+	DecoderPlugin("openmpt", mod_decode, openmpt_scan_file)
 	.WithInit(openmpt_decoder_init)
+	.WithContainer(openmpt_container_scan)
 	.WithSuffixes(mod_suffixes);
